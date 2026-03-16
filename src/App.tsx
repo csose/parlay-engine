@@ -45,33 +45,6 @@ const TIER_CFG   = {
   VALUE:  { color:"#fbbf24", bg:"rgba(251,191,36,.13)", border:"rgba(251,191,36,.40)", label:"💎 Value"  },
 } as const;
 
-// ─── System prompt sent to Claude vision ────────────────────────────────────
-const SYSTEM = `You are an expert sports betting analyst. The user will send you one or more FanDuel sportsbook screenshots.
-
-Extract EVERY visible player prop bet and return ONLY a valid JSON array — no markdown, no explanation, nothing else.
-
-Each object must have exactly these fields:
-{
-  "player":    "Full player name",
-  "prop":      "e.g. 20+ Points",
-  "odds":      integer (American odds, e.g. -164 or +122),
-  "game":      "Team A vs Team B",
-  "tier":      "LOCK" | "STRONG" | "VALUE",
-  "trueProb":  integer 0-100,
-  "ev":        "+X.X%" or "-X.X%",
-  "kelly":     "$XX"
-}
-
-Tier rules (after devigging):
-
-- LOCK   = true probability >= 73%
-- STRONG = true probability 60-72%
-- VALUE  = true probability < 60% but EV is positive
-
-EV formula: (trueProb/100 x decimalOdds) - 1, expressed as a percentage.
-Kelly suggested bet assumes $1,000 bankroll, 25% fractional Kelly.
-Return ONLY the JSON array.`;
-
 // ─── Main component ──────────────────────────────────────────────────────────
 function ParlayEngine() {
   const [tab,       setTab]       = useState("UPLOAD");
@@ -109,31 +82,27 @@ function ParlayEngine() {
     setError(null);
 
     try {
-      const content = [];
+      const imagePayloads = [];
       for (const img of images) {
         const b64  = await toBase64(img.file);
         const mime = img.file.type || "image/png";
-        content.push({ type: "image", source: { type: "base64", media_type: mime, data: b64 } });
+        imagePayloads.push({ data: b64, mediaType: mime });
       }
-      content.push({ type: "text", text: "Extract all player props from these FanDuel screenshots and return the JSON array." });
 
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
-        method:  "POST",
+      const apiUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/analyze-screenshots`;
+      const res = await fetch(apiUrl, {
+        method: "POST",
         headers: {
+          "Authorization": `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
           "Content-Type": "application/json",
-          "x-api-key": "YOUR_API_KEY_HERE",
-          "anthropic-version": "2023-06-01",
-          "anthropic-dangerous-direct-browser-access": "true"
         },
-        body: JSON.stringify({
-          model:      "claude-sonnet-4-20250514",
-          max_tokens: 4000,
-          system:     SYSTEM,
-          messages:   [{ role: "user", content }],
-        }),
+        body: JSON.stringify({ images: imagePayloads }),
       });
 
-      if (!res.ok) throw new Error(`API error ${res.status} — check your API key`);
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.error || `API error ${res.status}`);
+      }
       const data = await res.json();
 
       const raw    = data.content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("");
