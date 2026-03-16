@@ -38,7 +38,7 @@ except ImportError:
 # CONFIG
 # =============================================================================
 
-ODDS_API_KEY = "268e7e91ea671f4710b057dde90bb5f2" # Replace with your actual key
+API_KEY = "268e7e91ea671f4710b057dde90bb5f2" # 
 
 SPORTS = [
     "basketball_nba",
