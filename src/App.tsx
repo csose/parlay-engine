@@ -16,6 +16,7 @@
 
 import argparse
 import logging
+import os
 from dataclasses import dataclass
 from itertools import combinations
 from typing import List
@@ -38,7 +39,7 @@ except ImportError:
 # CONFIG
 # =============================================================================
 
-API_KEY = "268e7e91ea671f4710b057dde90bb5f2" # 
+API_KEY = os.environ.get("ODDS_API_KEY", "")
 
 SPORTS = [
     "basketball_nba",
@@ -133,7 +134,7 @@ def fetch_odds() -> pd.DataFrame:
     base = "https://api.the-odds-api.com/v4/sports"
     for sport in SPORTS:
         url = f"{base}/{sport}/odds"
-        params = {"apiKey": ODDS_API_KEY, "regions": "us", "markets": "h2h", "oddsFormat": "american"}
+        params = {"apiKey": API_KEY, "regions": "us", "markets": "h2h", "oddsFormat": "american"}
         try:
             r = requests.get(url, params=params, timeout=10)
             r.raise_for_status()
