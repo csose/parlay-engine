@@ -330,8 +330,11 @@ class MasterProbabilityModel:
         self.feature_names = X.columns.tolist()
         self.model.fit(X, y)
         self._is_trained = True
-        scores = cross_val_score(self.model, X, y, cv=3, scoring='brier_score_loss')
-        logger.info(f"MasterProbabilityModel trained. Brier loss: {-np.mean(scores):.4f}")
+        if len(X) >= 6:
+            scores = cross_val_score(self.model, X, y, cv=3, scoring='neg_brier_score')
+            logger.info(f"MasterProbabilityModel trained. Brier loss: {-np.mean(scores):.4f}")
+        else:
+            logger.info("MasterProbabilityModel trained. (Too few samples for cross-validation)")
 
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
         if not self._is_trained: raise RuntimeError("Model not trained.")
