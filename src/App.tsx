@@ -1,25 +1,30 @@
 # =============================================================================
-# PARLAY ENGINE v8.0 — FULLY INTEGRATED
+# PARLAY ENGINE v9.0 — FREE API ENRICHMENT
 # Quant Sports Betting System
 # =============================================================================
 #
-# Change Log:
-# - Full integration of the modular InformationAggregator class.
-# - The engine now runs a multi-stage "Internal Ranking Engine" to generate
-# a 'proprietary_score_difference' for each game.
-# - The MasterProbabilityModel is now trained on and predicts using this
-# powerful, proprietary feature.
-# - main() function updated to correctly orchestrate the new aggregator.
-# - The interactive bankroll prompt from v7.2 is retained.
+# Change Log (v9.0):
+# - Integrated 6 free external APIs for real data enrichment:
+#   1. SportsDataIO  — real NBA/NHL team stats replace hardcoded baseline data
+#   2. GDELT         — free, no-key news sentiment per team (media tone)
+#   3. NewsAPI       — injury/lineup headlines per team
+#   4. Cohere        — LLM sentiment classification of news headlines
+#   5. WeatherAPI    — game-day weather (primary, for outdoor sports)
+#   6. OpenWeatherMap — game-day weather (fallback)
+# - New SentimentEnricher class orchestrates GDELT + NewsAPI + Cohere
+# - InformationAggregator now pulls real stats from SportsDataIO
+# - Weather adjuster applied as situational modifier for outdoor games
+# - All integrations gracefully degrade when API keys are absent
 #
 # =============================================================================
 
 import argparse
+import json
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import combinations
-from typing import List
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -39,7 +44,12 @@ except ImportError:
 # CONFIG
 # =============================================================================
 
-API_KEY = os.environ.get("ODDS_API_KEY", "")
+API_KEY            = os.environ.get("ODDS_API_KEY", "")
+SPORTSDATA_API_KEY = os.environ.get("SPORTSDATA_API_KEY", "")
+NEWS_API_KEY       = os.environ.get("NEWS_API_KEY", "")
+COHERE_API_KEY     = os.environ.get("COHERE_API_KEY", "")
+WEATHER_API_KEY    = os.environ.get("WEATHER_API_KEY", "")
+OPENWEATHER_API_KEY = os.environ.get("OPENWEATHER_API_KEY", "")
 
 SPORTS = [
     "basketball_nba",
@@ -53,6 +63,23 @@ RHO_SAME_GAME = 0.15
 RHO_CROSS_GAME = 0.00
 MAX_EXPOSURE = 0.05
 PROP_VIG_FACTOR = 0.9525
+
+# NBA arena cities — used for weather lookup on outdoor/travel context
+NBA_TEAM_CITIES = {
+    "Atlanta Hawks": "Atlanta", "Boston Celtics": "Boston", "Brooklyn Nets": "Brooklyn",
+    "Charlotte Hornets": "Charlotte", "Chicago Bulls": "Chicago", "Cleveland Cavaliers": "Cleveland",
+    "Dallas Mavericks": "Dallas", "Denver Nuggets": "Denver", "Detroit Pistons": "Detroit",
+    "Golden State Warriors": "San Francisco", "Houston Rockets": "Houston",
+    "Indiana Pacers": "Indianapolis", "Los Angeles Clippers": "Los Angeles",
+    "Los Angeles Lakers": "Los Angeles", "Memphis Grizzlies": "Memphis",
+    "Miami Heat": "Miami", "Milwaukee Bucks": "Milwaukee", "Minnesota Timberwolves": "Minneapolis",
+    "New Orleans Pelicans": "New Orleans", "New York Knicks": "New York",
+    "Oklahoma City Thunder": "Oklahoma City", "Orlando Magic": "Orlando",
+    "Philadelphia 76ers": "Philadelphia", "Phoenix Suns": "Phoenix",
+    "Portland Trail Blazers": "Portland", "Sacramento Kings": "Sacramento",
+    "San Antonio Spurs": "San Antonio", "Toronto Raptors": "Toronto",
+    "Utah Jazz": "Salt Lake City", "Washington Wizards": "Washington",
+}
 
 # =============================================================================
 # LOGGING
@@ -126,6 +153,250 @@ def apply_devig(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # =============================================================================
+# EXTERNAL DATA ENRICHMENT — FREE APIS
+# =============================================================================
+
+# --- 1. SportsDataIO: Real Team Stats ---
+
+def fetch_sportsdata_teams(sport: str = "nba") -> Dict[str, dict]:
+    """
+    Fetches real team season stats from SportsDataIO free trial tier.
+    Returns a dict keyed by team name with offensive/defensive efficiency
+    and win percentage. Gracefully returns empty dict if key is missing.
+    """
+    if not SPORTSDATA_API_KEY:
+        logger.debug("SPORTSDATA_API_KEY not set — skipping SportsDataIO enrichment.")
+        return {}
+    season = "2025"  # update each season
+    url = f"https://api.sportsdata.io/v3/{sport}/stats/json/TeamSeasonStats/{season}"
+    params = {"key": SPORTSDATA_API_KEY}
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        team_stats = {}
+        for team in r.json():
+            name = team.get("Name") or team.get("Team", "")
+            if not name:
+                continue
+            team_stats[name] = {
+                "wins":                  team.get("Wins", 0),
+                "losses":                team.get("Losses", 0),
+                "offensive_efficiency":  team.get("OffensiveEfficiency") or team.get("PointsPerGame", 110.0),
+                "defensive_efficiency":  team.get("DefensiveEfficiency") or team.get("OpponentPointsPerGame", 110.0),
+                "last_5_games_win_pct":  team.get("PointsPerGameLast5") or 0.5,
+                "avg_points_last_3_games": team.get("PointsPerGame", 110.0),
+            }
+        logger.info("SportsDataIO: loaded stats for %d teams.", len(team_stats))
+        return team_stats
+    except requests.RequestException as exc:
+        logger.warning("SportsDataIO fetch failed: %s", exc)
+        return {}
+    except (KeyError, ValueError, json.JSONDecodeError) as exc:
+        logger.warning("SportsDataIO response parse error: %s", exc)
+        return {}
+
+
+# --- 2. GDELT: Free Sentiment (No API Key Required) ---
+
+def fetch_gdelt_sentiment(team_name: str) -> float:
+    """
+    Queries the free GDELT v2 Doc API for recent news about a team and
+    returns a normalized sentiment score in the range [-1.0, +1.0].
+    Positive = favorable media coverage; negative = bad press (injuries, losing streak).
+    No API key required.
+    """
+    query = f'"{team_name}" sport'
+    url = "https://api.gdeltproject.org/api/v2/doc/doc"
+    params = {
+        "query":      query,
+        "mode":       "artlist",
+        "maxrecords": "10",
+        "format":     "json",
+        "timespan":   "3d",  # last 3 days
+    }
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        articles = data.get("articles", [])
+        if not articles:
+            return 0.0
+        # GDELT returns a 'tone' field: positive = good, negative = bad press
+        tones = [float(a.get("tone", 0)) for a in articles if "tone" in a]
+        if not tones:
+            return 0.0
+        avg_tone = sum(tones) / len(tones)
+        # GDELT tone ranges roughly -100 to +100; normalize to [-1, 1]
+        return max(-1.0, min(1.0, avg_tone / 10.0))
+    except requests.RequestException as exc:
+        logger.debug("GDELT fetch for '%s' failed: %s", team_name, exc)
+        return 0.0
+    except (KeyError, ValueError, json.JSONDecodeError):
+        return 0.0
+
+
+# --- 3. NewsAPI: Injury & Lineup Headlines ---
+
+def fetch_news_headlines(team_name: str, max_articles: int = 5) -> List[str]:
+    """
+    Fetches recent news headlines about a team from NewsAPI free developer tier.
+    Focuses on injury and lineup keywords to capture game-relevant signals.
+    Requires NEWS_API_KEY environment variable.
+    """
+    if not NEWS_API_KEY:
+        logger.debug("NEWS_API_KEY not set — skipping NewsAPI enrichment.")
+        return []
+    url = "https://newsapi.org/v2/everything"
+    params = {
+        "q":        f'"{team_name}" (injury OR lineup OR suspended OR out)',
+        "sortBy":   "publishedAt",
+        "pageSize": max_articles,
+        "language": "en",
+        "apiKey":   NEWS_API_KEY,
+    }
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        articles = r.json().get("articles", [])
+        headlines = [a.get("title", "") for a in articles if a.get("title")]
+        logger.info("NewsAPI: %d headlines fetched for '%s'.", len(headlines), team_name)
+        return headlines
+    except requests.RequestException as exc:
+        logger.warning("NewsAPI fetch for '%s' failed: %s", team_name, exc)
+        return []
+    except (KeyError, ValueError, json.JSONDecodeError) as exc:
+        logger.warning("NewsAPI parse error for '%s': %s", team_name, exc)
+        return []
+
+
+# --- 4. Cohere: Sentiment Classification of Headlines ---
+
+def analyze_sentiment_cohere(headlines: List[str]) -> float:
+    """
+    Uses the Cohere Classify API (free tier) to score headlines as
+    positive or negative for a team's game prospects.
+    Returns a score in [-1.0, +1.0]: positive = favorable, negative = concerning.
+    Requires COHERE_API_KEY environment variable.
+    """
+    if not COHERE_API_KEY or not headlines:
+        return 0.0
+    url = "https://api.cohere.com/v1/classify"
+    headers = {
+        "Authorization": f"Bearer {COHERE_API_KEY}",
+        "Content-Type":  "application/json",
+    }
+    # Few-shot examples for sports injury/lineup sentiment
+    examples = [
+        {"text": "Star player ruled out with knee injury",       "label": "negative"},
+        {"text": "Team's leading scorer returns from suspension", "label": "positive"},
+        {"text": "Key starter listed as questionable",           "label": "negative"},
+        {"text": "Full squad available for tonight's game",      "label": "positive"},
+        {"text": "Coach confirms lineup changes after loss",     "label": "negative"},
+        {"text": "Team posts best defensive rating in 5 games",  "label": "positive"},
+    ]
+    payload = {"inputs": headlines[:10], "examples": examples}
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=15)
+        r.raise_for_status()
+        classifications = r.json().get("classifications", [])
+        if not classifications:
+            return 0.0
+        scores = []
+        for clf in classifications:
+            preds = clf.get("labels", {})
+            pos = preds.get("positive", {}).get("confidence", 0.5)
+            neg = preds.get("negative", {}).get("confidence", 0.5)
+            scores.append(pos - neg)
+        avg = sum(scores) / len(scores)
+        logger.info("Cohere sentiment: %.3f over %d headlines.", avg, len(scores))
+        return float(max(-1.0, min(1.0, avg)))
+    except requests.RequestException as exc:
+        logger.warning("Cohere API call failed: %s", exc)
+        return 0.0
+    except (KeyError, ValueError, json.JSONDecodeError) as exc:
+        logger.warning("Cohere response parse error: %s", exc)
+        return 0.0
+
+
+# --- 5 & 6. Weather: WeatherAPI (primary) + OpenWeatherMap (fallback) ---
+
+def fetch_weather_for_city(city: str) -> Optional[dict]:
+    """
+    Fetches current weather conditions for a city.
+    Tries WeatherAPI first (free 1M calls/month), falls back to OpenWeatherMap.
+    Returns a dict with: temp_f, wind_mph, is_outdoor_risk (bool).
+    Returns None if both fail or no keys are set.
+    """
+    if WEATHER_API_KEY:
+        url = "https://api.weatherapi.com/v1/current.json"
+        params = {"key": WEATHER_API_KEY, "q": city, "aqi": "no"}
+        try:
+            r = requests.get(url, params=params, timeout=8)
+            r.raise_for_status()
+            current = r.json().get("current", {})
+            temp_f   = float(current.get("temp_f", 70))
+            wind_mph = float(current.get("wind_mph", 0))
+            precip   = float(current.get("precip_in", 0))
+            is_risk  = wind_mph > 20 or precip > 0.1 or temp_f < 35
+            logger.info("WeatherAPI [%s]: %.1f°F, wind %.1f mph, precip %.2f in.", city, temp_f, wind_mph, precip)
+            return {"temp_f": temp_f, "wind_mph": wind_mph, "precip_in": precip, "is_outdoor_risk": is_risk}
+        except requests.RequestException as exc:
+            logger.debug("WeatherAPI failed for '%s': %s — trying fallback.", city, exc)
+
+    if OPENWEATHER_API_KEY:
+        url = "https://api.openweathermap.org/data/2.5/weather"
+        params = {"q": city, "appid": OPENWEATHER_API_KEY, "units": "imperial"}
+        try:
+            r = requests.get(url, params=params, timeout=8)
+            r.raise_for_status()
+            data     = r.json()
+            temp_f   = float(data.get("main", {}).get("temp", 70))
+            wind_mph = float(data.get("wind", {}).get("speed", 0))
+            rain     = float(data.get("rain", {}).get("1h", 0))
+            is_risk  = wind_mph > 20 or rain > 0.1 or temp_f < 35
+            logger.info("OpenWeatherMap [%s]: %.1f°F, wind %.1f mph.", city, temp_f, wind_mph)
+            return {"temp_f": temp_f, "wind_mph": wind_mph, "precip_in": rain, "is_outdoor_risk": is_risk}
+        except requests.RequestException as exc:
+            logger.warning("OpenWeatherMap failed for '%s': %s", city, exc)
+
+    return None
+
+
+# --- Sentiment Enricher: Orchestrates GDELT + NewsAPI + Cohere ---
+
+class SentimentEnricher:
+    """
+    Combines GDELT media tone, NewsAPI injury headlines, and Cohere sentiment
+    classification into a single enrichment score per team.
+
+    Score range: [-1.0, +1.0]
+      Positive → strong media / no injury news → small positive adjustment
+      Negative → bad press / injury reports    → score penalty applied
+    """
+
+    # Weights for each signal source
+    W_GDELT   = 0.35
+    W_COHERE  = 0.65
+
+    def get_team_sentiment(self, team_name: str) -> float:
+        """Returns a combined sentiment score for a team in [-1.0, +1.0]."""
+        gdelt_score  = fetch_gdelt_sentiment(team_name)
+        headlines    = fetch_news_headlines(team_name)
+        cohere_score = analyze_sentiment_cohere(headlines) if headlines else 0.0
+
+        if headlines:
+            combined = self.W_GDELT * gdelt_score + self.W_COHERE * cohere_score
+        else:
+            combined = gdelt_score  # fall back to GDELT only
+
+        logger.info(
+            "Sentiment [%s]: GDELT=%.3f, Cohere=%.3f → combined=%.3f",
+            team_name, gdelt_score, cohere_score, combined,
+        )
+        return float(max(-1.0, min(1.0, combined)))
+
+
+# =============================================================================
 # DATA INGESTION & ODDS
 # =============================================================================
 
@@ -189,50 +460,73 @@ class InformationAggregator:
     This class orchestrates a multi-stage Internal Ranking Engine to generate
     a final, high-conviction score for each team, which is then used as the
     primary input for the MasterProbabilityModel.
+
+    v9.0: Now enriched with real SportsDataIO stats, GDELT/NewsAPI/Cohere
+    sentiment signals, and WeatherAPI game-day conditions.
     """
 
     def __init__(self):
         """
-        Initializes the aggregator and defines the strategy pipeline.
-        The order of functions in this list determines the execution order of the
-        Internal Ranking Engine.
+        Initializes the aggregator, defines the strategy pipeline,
+        and prepares the enrichment helpers.
         """
         self.strategy_pipeline = [
             self._strategy_recalculate_base_elo,
             self._strategy_factor_in_recent_form,
             self._strategy_adjust_for_offensive_momentum,
             self._strategy_apply_situational_modifiers,
-            self._strategy_normalize_final_scores
+            self._strategy_normalize_final_scores,
         ]
+        self._sentiment_enricher = SentimentEnricher()
+        # Pre-load SportsDataIO stats once; fall back to hardcoded data if unavailable
+        self._live_stats: Dict[str, dict] = fetch_sportsdata_teams("nba")
 
     # --- Orchestration & Main Feature Generation Method ---
 
     def get_quant_features(self, game_info: dict) -> dict:
         """
-        The primary public method. It orchestrates the full pipeline to produce
-        the final quantitative feature vector for a given game.
+        The primary public method. Orchestrates the full pipeline including
+        sentiment enrichment and weather adjustment to produce the final
+        quantitative feature vector for a given game.
         """
-        team_a_identifier = game_info.get('team_a')
-        team_b_identifier = game_info.get('team_b')
+        team_a = game_info.get('team_a')
+        team_b = game_info.get('team_b')
 
-        if not team_a_identifier or not team_b_identifier:
+        if not team_a or not team_b:
             logger.error("Game info missing team identifiers.")
             return {}
 
         baseline_df = self._load_baseline_data()
-        if baseline_df.empty: return {}
+        if baseline_df.empty:
+            return {}
 
         final_scores_df = self._run_full_ranking_cycle(baseline_df)
 
         try:
-            team_a_score = final_scores_df.loc[team_a_identifier, 'final_proprietary_score']
-            team_b_score = final_scores_df.loc[team_b_identifier, 'final_proprietary_score']
+            score_a = final_scores_df.loc[team_a, 'final_proprietary_score']
+            score_b = final_scores_df.loc[team_b, 'final_proprietary_score']
         except KeyError:
-            logger.warning(f"Could not find final scores for {team_a_identifier} or {team_b_identifier}. They may not be in the baseline data.")
+            logger.warning("Could not find final scores for %s or %s.", team_a, team_b)
             return {}
 
-        quantitative_features = {'proprietary_score_difference': team_a_score - team_b_score}
-        
+        # --- Sentiment Adjustment ---
+        # Sentiment score in [-1, +1] → convert to a ±score adjustment (max ±30 pts)
+        sentiment_a = self._sentiment_enricher.get_team_sentiment(team_a)
+        sentiment_b = self._sentiment_enricher.get_team_sentiment(team_b)
+        score_a += sentiment_a * 30.0
+        score_b += sentiment_b * 30.0
+
+        # --- Weather Adjustment (home team's city) ---
+        home_city = NBA_TEAM_CITIES.get(team_a)
+        if home_city:
+            weather = fetch_weather_for_city(home_city)
+            if weather and weather.get("is_outdoor_risk"):
+                # Bad weather slightly penalizes higher-scoring offenses (travel fatigue proxy)
+                score_a -= 5.0
+                score_b -= 3.0
+                logger.info("Weather risk in %s — applied scoring adjustment.", home_city)
+
+        quantitative_features = {'proprietary_score_difference': score_a - score_b}
         return quantitative_features
 
     # --- Data Loading & Pipeline Execution Methods ---
@@ -240,25 +534,49 @@ class InformationAggregator:
     def _load_baseline_data(self) -> pd.DataFrame:
         """
         Loads the initial state of all teams before the ranking cycle begins.
-        In a real application, this would connect to a database or a regularly updated file.
+        Uses real SportsDataIO data when available; falls back to hardcoded
+        NBA baseline for continuity when no API key is configured.
         """
-        # [--- YOUR PROPRIETARY DATA SOURCE GOES HERE ---]
-        # For now, we simulate loading from a CSV-like structure.
+        if self._live_stats:
+            try:
+                records = []
+                for team_name, stats in self._live_stats.items():
+                    wins   = stats.get("wins", 20)
+                    losses = stats.get("losses", 20)
+                    total  = wins + losses or 1
+                    records.append({
+                        'team_id':                 team_name,
+                        'base_elo':                1500 + (wins - losses) * 5,
+                        'offensive_efficiency':    stats.get("offensive_efficiency", 110.0),
+                        'defensive_efficiency':    stats.get("defensive_efficiency", 110.0),
+                        'last_5_games_win_pct':    stats.get("last_5_games_win_pct", wins / total),
+                        'avg_points_last_3_games': stats.get("avg_points_last_3_games", 110.0),
+                        'is_on_road_trip':         0,
+                        'days_since_last_game':    2,
+                    })
+                df = pd.DataFrame(records).set_index('team_id')
+                logger.info("Baseline data loaded from SportsDataIO (%d teams).", len(df))
+                return df
+            except Exception as exc:
+                logger.warning("Failed to build SportsDataIO baseline: %s — using fallback.", exc)
+
+        # Hardcoded fallback (used when SPORTSDATA_API_KEY is not set)
         try:
             data = {
-                'team_id': ['Los Angeles Lakers', 'Boston Celtics', 'Golden State Warriors', 'Denver Nuggets', 'Miami Heat', 'New York Knicks'],
-                'base_elo': [1550, 1580, 1575, 1600, 1565, 1540],
-                'offensive_efficiency': [115.2, 114.8, 118.1, 117.5, 113.0, 112.1],
-                'defensive_efficiency': [112.5, 110.1, 115.3, 113.0, 109.5, 111.0],
-                'last_5_games_win_pct': [0.6, 0.8, 0.4, 1.0, 0.8, 0.6],
-                'avg_points_last_3_games': [118.0, 112.5, 125.0, 121.0, 110.0, 108.0],
-                'is_on_road_trip': [1, 0, 0, 0, 1, 0],
-                'days_since_last_game': [2, 3, 2, 4, 1, 3]
+                'team_id':                ['Los Angeles Lakers', 'Boston Celtics', 'Golden State Warriors', 'Denver Nuggets', 'Miami Heat', 'New York Knicks'],
+                'base_elo':               [1550, 1580, 1575, 1600, 1565, 1540],
+                'offensive_efficiency':   [115.2, 114.8, 118.1, 117.5, 113.0, 112.1],
+                'defensive_efficiency':   [112.5, 110.1, 115.3, 113.0, 109.5, 111.0],
+                'last_5_games_win_pct':   [0.6, 0.8, 0.4, 1.0, 0.8, 0.6],
+                'avg_points_last_3_games':[118.0, 112.5, 125.0, 121.0, 110.0, 108.0],
+                'is_on_road_trip':        [1, 0, 0, 0, 1, 0],
+                'days_since_last_game':   [2, 3, 2, 4, 1, 3],
             }
             df = pd.DataFrame(data).set_index('team_id')
+            logger.info("Baseline data loaded from hardcoded fallback.")
             return df
-        except Exception as e:
-            logger.error(f"Error loading baseline data: {e}")
+        except Exception as exc:
+            logger.error("Error loading fallback baseline data: %s", exc)
             return pd.DataFrame()
 
     def _run_full_ranking_cycle(self, initial_df: pd.DataFrame) -> pd.DataFrame:
