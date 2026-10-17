@@ -1,0 +1,7 @@
+anthropic>=1.15,<2
+numpy>=2.0
+pandas>=2.2
+scipy>=1.13
+scikit-learn>=1.5
+requests>=2.32
+pytest>=8.0
